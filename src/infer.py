@@ -9,9 +9,8 @@ import matplotlib.pyplot as plt
 # Ensure we can import from project root
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from src.model import NeuroOCR
+from src.model_embedding import NeuroOCR
 from config.config import *
-from src.corrector import SpellCorrector
 
 def search_qdrant_http(vector):
     url = f"http://localhost:6333/collections/{COLLECTION_NAME}/points/search"
@@ -27,17 +26,16 @@ def load_model():
     model.eval()
     return model
 
+# --- MATHEMATICAL MORPHOLOGY UTILS ---
+
 def skeletonize(img):
     """
     Reduces the character to a 1-pixel wide skeleton.
-    This removes variations in pen pressure/thickness.
     """
     size = np.size(img)
     skel = np.zeros(img.shape, np.uint8)
-    
     element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3,3))
     done = False
-    
     temp_img = img.copy()
     
     while not done:
@@ -46,49 +44,44 @@ def skeletonize(img):
         temp = cv2.subtract(temp_img, temp)
         skel = cv2.bitwise_or(skel, temp)
         temp_img = eroded.copy()
-        
-        zeros = size - cv2.countNonZero(temp_img)
-        if zeros == size:
-            done = True
-            
+        if cv2.countNonZero(temp_img) == 0: done = True
     return skel
 
 def standardize_stroke_width(img):
     """
-    1. Skeletonize the character (shrink to 1px center line).
-    2. Re-draw it with a specific fixed thickness (e.g. 3-4px).
+    1. Skeletonize -> 2. Regrow with fixed thickness.
+    Ensures thin pens and thick markers look identical to the AI.
     """
     h, w = img.shape
     if h == 0 or w == 0: return img
 
-    # Sanity Check: Density
+    # Density Check (Ignore noise specks)
     non_zero = cv2.countNonZero(img)
-    if (non_zero / (h*w)) < 0.02: return np.zeros_like(img)
+    if (non_zero / (h*w)) < 0.01: return np.zeros_like(img)
 
-    # 1. Upscale for precision
+    # Upscale for precision processing
     target_h = 64
     scale = target_h / h
     target_w = int(w * scale)
-    if target_w > 400: target_w = 400 # Safety limit
+    if target_w > 400: target_w = 400
     
     img_resized = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
     
-    # 2. Skeletonize (Get the structure)
+    # Skeletonize
     skel = skeletonize(img_resized)
     
-    # 3. Regrow with Controlled Thickness
-    # EMNIST digits are roughly 4-5px thick at 28x28 resolution.
-    # At 64px height, we want a stroke of about 6-8px.
+    # Regrow (Fixed Thickness ~ 6px for 64px height)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     img_regrown = cv2.dilate(skel, kernel, iterations=1)
     
-    # 4. Smooth edges
+    # Smooth edges
     img_blur = cv2.GaussianBlur(img_regrown, (5, 5), 0)
     _, img_final = cv2.threshold(img_blur, 50, 255, cv2.THRESH_BINARY)
     
     return img_final
 
 def smart_resize_pad(img, size=28):
+    # Center of Mass Alignment (MNIST Style)
     coords = cv2.findNonZero(img)
     if coords is None: return np.zeros((size, size), dtype=np.float32)
     
@@ -97,8 +90,7 @@ def smart_resize_pad(img, size=28):
     
     rows, cols = img.shape
     if rows == 0 or cols == 0: return np.zeros((size, size), dtype=np.float32)
-
-    # Fit into 20x20 box inside 28x28 (Standard MNIST padding)
+    
     factor = 20.0 / max(rows, cols)
     rows, cols = int(rows * factor), int(cols * factor)
     rows, cols = max(1, rows), max(1, cols)
@@ -121,22 +113,18 @@ def merge_close_boxes(boxes, distance_threshold=20):
     if not boxes: return []
     boxes = sorted(boxes, key=lambda b: b[0])
     merged = []
-    
     curr_x, curr_y, curr_w, curr_h = boxes[0]
     
     for i in range(1, len(boxes)):
         next_x, next_y, next_w, next_h = boxes[i]
         
-        # Horizontal Proximity
         dist_x = next_x - (curr_x + curr_w)
         is_close_x = dist_x < distance_threshold
         
-        # Vertical Alignment
         curr_cy = curr_y + curr_h / 2
         next_cy = next_y + next_h / 2
         is_aligned_y = abs(curr_cy - next_cy) < 30 
         
-        # Containment
         is_contained = (next_x >= curr_x and (next_x + next_w) <= (curr_x + curr_w + 10))
         
         if (is_close_x and is_aligned_y) or is_contained:
@@ -160,23 +148,23 @@ def preprocess_image(img_path):
     # 1. Grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # 2. CLAHE (Contrast Boosting)
+    # 2. CLAHE (Contrast Boosting) - Crucial for faint pencil lines
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
     gray_boosted = clahe.apply(gray)
     
-    # 3. Denoising
+    # 3. Aggressive Denoising
     denoised = cv2.fastNlMeansDenoising(gray_boosted, None, 30, 7, 21)
     
-    # 4. Adaptive Thresholding
+    # 4. Adaptive Thresholding (Handles shadows/gradients)
     thresh = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, 15, 10)
+                                   cv2.THRESH_BINARY_INV, 15, 8)
     
-    # 5. Connection Pass (Glue vertical gaps)
-    # Smaller kernel here to avoid merging separate letters
-    kernel_connect = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 4))
+    # 5. Connection Pass (Vertical Glue)
+    # Connects broken parts of '5', 'T', 'E'
+    kernel_connect = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 5))
     thresh_connected = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_connect)
     
-    # 6. Clean Noise
+    # 6. Clean Noise (Speckle Removal)
     kernel_clean = np.ones((2,2), np.uint8)
     thresh_clean = cv2.morphologyEx(thresh_connected, cv2.MORPH_OPEN, kernel_clean)
 
@@ -184,45 +172,39 @@ def preprocess_image(img_path):
     contours, _ = cv2.findContours(thresh_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     all_boxes = [cv2.boundingRect(c) for c in contours]
     
-    # 8. Filter Noise
+    # 8. Filter Noise (Size Check)
     clean_boxes = []
     for (x,y,w,h) in all_boxes:
         if w > 4 and h > 10: clean_boxes.append((x,y,w,h))
             
-    # 9. Merge Logic (tuned threshold)
+    # 9. Merge Logic (Combine fragmented letters)
     merged_boxes = merge_close_boxes(clean_boxes, distance_threshold=15)
     
     valid_crops, valid_coords = [], []
     img_h, img_w = thresh.shape
     
     for (x, y, w, h) in merged_boxes:
-        if w > h * 6: continue 
+        if w > h * 6: continue # Skip long lines
         
-        # Add padding to avoid cutting edges
+        # Add Padding (Don't cut the ink edge)
         pad = 8
-        x1 = max(0, x - pad)
-        y1 = max(0, y - pad)
-        x2 = min(img_w, x + w + pad)
-        y2 = min(img_h, y + h + pad)
+        x1 = max(0, x - pad); y1 = max(0, y - pad)
+        x2 = min(img_w, x + w + pad); y2 = min(img_h, y + h + pad)
         
         # Crop from the Clean Threshold
         roi = thresh[y1:y2, x1:x2]
         
-        # --- SKELETONIZE & REGROW ---
-        # This standardizes thickness without merging neighbors
+        # 10. Standardize Thickness (Skeleton -> Regrow)
         roi = standardize_stroke_width(roi)
-        # ----------------------------
         
         if cv2.countNonZero(roi) == 0: continue
 
+        # Resize & Normalize
         roi = roi.astype('float32') / 255.0
         roi = smart_resize_pad(roi, size=28)
         
-        # Binary Force
-        roi[roi > 0.2] = 1.0 
-        roi[roi <= 0.2] = 0.0
-        
-        # Normalize
+        # Binary Force (0 or 1, no grays)
+        roi[roi > 0.2] = 1.0; roi[roi <= 0.2] = 0.0 
         roi = (roi - 0.5) / 0.5
         
         valid_crops.append(roi)
@@ -236,6 +218,7 @@ def recognize_text(image_path):
     result_text = ""
     print(f"Found {len(crops)} chars. Reading...")
     
+    # DEBUG: View inputs
     if len(crops) > 0:
         debug_cols = min(len(crops), 15)
         plt.figure(figsize=(15, 2))
@@ -244,7 +227,7 @@ def recognize_text(image_path):
             plt.imshow(crops[i], cmap='gray')
             plt.axis('off')
             plt.title(f"#{i+1}")
-        plt.suptitle("Input to AI (Skeletonized & Regrown)")
+        plt.suptitle("Input to AI (Processed)")
         plt.show(block=False)
         plt.pause(0.5)
 
@@ -269,14 +252,6 @@ def recognize_text(image_path):
     
     final_text = result_text
     display_text = f"Raw: {result_text}"
-
-    if SPELL_CHECK:
-        corrector = SpellCorrector()
-        corrected = corrector.correct(result_text)
-        if corrected != result_text:
-            print(f"✨ SPELL CHECK: {corrected}")
-            final_text = corrected
-            display_text += f"\nCorrected: {final_text}"
     
     plt.figure(figsize=(10, 6))
     plt.imshow(cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB))

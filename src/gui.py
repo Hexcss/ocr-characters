@@ -14,7 +14,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from src.model import NeuroOCR
+from src.model_embedding import NeuroOCR
 from config.config import *
 from src.infer import smart_resize_pad, search_qdrant_http, load_model
 
