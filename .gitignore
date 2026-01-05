@@ -1,4 +1,6 @@
-venv
+.venv
 data
 __pycache__
-qdrant_storage
+*.zip
+out
+synthetic_dataset

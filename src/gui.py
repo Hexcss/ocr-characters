@@ -197,10 +197,13 @@ class NeuroDrawApp:
             roi = img_np[y:y+h, x:x+w]
             roi = roi.astype('float32') / 255.0
             processed_roi = smart_resize_pad(roi, size=28)
+            processed_roi = processed_roi.astype(np.float32) / 255.0 
             processed_roi = (processed_roi - 0.5) / 0.5
             
             # Infer
-            tensor_img = torch.tensor(processed_roi).unsqueeze(0).unsqueeze(0).to(DEVICE)
+            # FIX: Explicitly cast to float32 here to prevent RuntimeError
+            tensor_img = torch.tensor(processed_roi, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(DEVICE)
+            
             with torch.no_grad():
                 _, embedding = self.model(tensor_img)
             

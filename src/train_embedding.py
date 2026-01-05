@@ -220,7 +220,7 @@ def train_and_index():
     # Use standard EMNIST as reference index
     index_loader = DataLoader(ds_emnist_c, batch_size=1, shuffle=False, num_workers=0)
 
-    model = NeuroOCR(num_classes=47, embedding_dim=EMBEDDING_DIM).to(DEVICE)
+    model = NeuroOCR(num_classes=62, embedding_dim=EMBEDDING_DIM).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.CrossEntropyLoss()
 

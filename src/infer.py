@@ -4,13 +4,20 @@ import requests
 import cv2
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
+import json
+import glob
+from pathlib import Path
 
-# Ensure we can import from project root
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Adjust path to include root
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.model_embedding import NeuroOCR
 from config.config import *
+
+# --- Setup Paths ---
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+TEST_DIR = os.path.join(ROOT_DIR, "tests")
+OUT_DIR = os.path.join(ROOT_DIR, "out")
 
 def search_qdrant_http(vector):
     url = f"http://localhost:6333/collections/{COLLECTION_NAME}/points/search"
@@ -18,247 +25,473 @@ def search_qdrant_http(vector):
     try:
         response = requests.post(url, json=payload, timeout=1.0)
         return response.json().get("result", []) if response.status_code == 200 else None
-    except: return None
+    except:
+        return None
+
 
 def load_model():
-    model = NeuroOCR(num_classes=47, embedding_dim=EMBEDDING_DIM).to(DEVICE)
+    model = NeuroOCR(num_classes=62, embedding_dim=EMBEDDING_DIM).to(DEVICE)
     model.load_state_dict(torch.load("neuro_ocr_model.pth", map_location=DEVICE))
     model.eval()
     return model
 
-# --- MATHEMATICAL MORPHOLOGY UTILS ---
+
+# --- CLASSICAL VISION PIPELINE ---
+
+def auto_invert_to_paper_mode(img_gray):
+    """
+    NEW: Analyzes the image brightness. 
+    If the background is dark (mean < 127), inverts it to create 
+    Black Text on White Background. This fixes Test 6 & 9.
+    """
+    # Use a central crop to avoid black scanning borders affecting the mean
+    h, w = img_gray.shape
+    center = img_gray[int(h*0.2):int(h*0.8), int(w*0.2):int(w*0.8)]
+    
+    if center.size == 0:
+        mean_val = np.mean(img_gray)
+    else:
+        mean_val = np.mean(center)
+    
+    if mean_val < 127:
+        print("    [Info] Detected Dark Background. Inverting.")
+        return 255 - img_gray
+    return img_gray
+
 
 def skeletonize(img):
     """
-    Reduces the character to a 1-pixel wide skeleton.
+    Iterative erosion to reduce characters to 1-pixel wide skeletons.
+    Used to normalize stroke width.
     """
-    size = np.size(img)
     skel = np.zeros(img.shape, np.uint8)
-    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3,3))
+    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
     done = False
     temp_img = img.copy()
-    
+
     while not done:
         eroded = cv2.erode(temp_img, element)
         temp = cv2.dilate(eroded, element)
         temp = cv2.subtract(temp_img, temp)
         skel = cv2.bitwise_or(skel, temp)
         temp_img = eroded.copy()
-        if cv2.countNonZero(temp_img) == 0: done = True
+        if cv2.countNonZero(temp_img) == 0:
+            done = True
     return skel
+
 
 def standardize_stroke_width(img):
     """
-    1. Skeletonize -> 2. Regrow with fixed thickness.
-    Ensures thin pens and thick markers look identical to the AI.
+    RESTORED: The 'Magic' Normalizer.
+    1. Resizes to 64px height (Low-pass filter against noise).
+    2. Skeletonizes (Removes style/thickness variations).
+    3. Re-dilates (Creates uniform fat strokes matching EMNIST training data).
     """
     h, w = img.shape
-    if h == 0 or w == 0: return img
+    if h == 0 or w == 0:
+        return img
 
-    # Density Check (Ignore noise specks)
+    # Filter out empty crops
     non_zero = cv2.countNonZero(img)
-    if (non_zero / (h*w)) < 0.01: return np.zeros_like(img)
+    if (non_zero / (h * w)) < 0.01:
+        return np.zeros_like(img)
 
-    # Upscale for precision processing
+    # 1. Resize to fixed height (64px)
     target_h = 64
     scale = target_h / h
     target_w = int(w * scale)
-    if target_w > 400: target_w = 400
-    
+    if target_w > 400: target_w = 400 # Cap width
+
     img_resized = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_CUBIC)
-    
-    # Skeletonize
+
+    # 2. Skeletonize
     skel = skeletonize(img_resized)
-    
-    # Regrow (Fixed Thickness ~ 6px for 64px height)
+
+    # 3. Re-grow to standard thickness
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     img_regrown = cv2.dilate(skel, kernel, iterations=1)
-    
-    # Smooth edges
+
+    # 4. Smooth edges
     img_blur = cv2.GaussianBlur(img_regrown, (5, 5), 0)
     _, img_final = cv2.threshold(img_blur, 50, 255, cv2.THRESH_BINARY)
-    
+
     return img_final
 
+
 def smart_resize_pad(img, size=28):
-    # Center of Mass Alignment (MNIST Style)
+    """
+    Standard MNIST-style resizing:
+    1. Find bounding box of content.
+    2. Resize content to fit in 20x20 box (preserving aspect ratio).
+    3. Center using Center of Mass.
+    """
+    if img is None or getattr(img, "size", 0) == 0:
+        return np.zeros((size, size), dtype=np.uint8)
+
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    if img.dtype != np.uint8:
+        img = (img * 255).astype(np.uint8) if float(np.max(img)) <= 1.0 else img.astype(np.uint8)
+
+    # Threshold to ensure binary
+    img = np.where(img > 0, 255, 0).astype(np.uint8)
+
     coords = cv2.findNonZero(img)
-    if coords is None: return np.zeros((size, size), dtype=np.float32)
-    
+    if coords is None:
+        return np.zeros((size, size), dtype=np.uint8)
+
     x, y, w, h = cv2.boundingRect(coords)
-    img = img[y:y+h, x:x+w]
-    
+    img = img[y : y + h, x : x + w]
+
     rows, cols = img.shape
-    if rows == 0 or cols == 0: return np.zeros((size, size), dtype=np.float32)
-    
-    factor = 20.0 / max(rows, cols)
-    rows, cols = int(rows * factor), int(cols * factor)
-    rows, cols = max(1, rows), max(1, cols)
-    
-    img = cv2.resize(img, (cols, rows), interpolation=cv2.INTER_AREA)
-    
-    final_img = np.zeros((28, 28), dtype=np.float32)
-    col_center, row_center = (28 - cols) // 2, (28 - rows) // 2
-    final_img[row_center:row_center+rows, col_center:col_center+cols] = img
-    
-    M = cv2.moments(final_img)
-    if M["m00"] > 0:
-        cX, cY = M["m10"] / M["m00"], M["m01"] / M["m00"]
-        shift_x, shift_y = 14 - cX, 14 - cY
-        M_affine = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
-        final_img = cv2.warpAffine(final_img, M_affine, (28, 28))
+    if rows == 0 or cols == 0:
+        return np.zeros((size, size), dtype=np.uint8)
+
+    # Fit into 20x20 box inside 28x28
+    factor = 20.0 / float(max(rows, cols))
+    new_rows = max(1, int(round(rows * factor)))
+    new_cols = max(1, int(round(cols * factor)))
+
+    img = cv2.resize(img, (new_cols, new_rows), interpolation=cv2.INTER_NEAREST)
+
+    final_img = np.zeros((size, size), dtype=np.uint8)
+    row0 = (size - new_rows) // 2
+    col0 = (size - new_cols) // 2
+    final_img[row0 : row0 + new_rows, col0 : col0 + new_cols] = img
+
+    # Center of Mass Alignment
+    mom = cv2.moments(final_img)
+    if mom["m00"] > 0:
+        cX = mom["m10"] / mom["m00"]
+        cY = mom["m01"] / mom["m00"]
+        shift_x = (size / 2.0) - float(cX)
+        shift_y = (size / 2.0) - float(cY)
+
+        M_affine = np.array(
+            [[1.0, 0.0, shift_x], [0.0, 1.0, shift_y]],
+            dtype=np.float32,
+        )
+
+        final_img = cv2.warpAffine(
+            final_img,
+            M_affine,
+            (size, size),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
     return final_img
 
-def merge_close_boxes(boxes, distance_threshold=20):
-    if not boxes: return []
-    boxes = sorted(boxes, key=lambda b: b[0])
+def merge_component_boxes(boxes):
+    if not boxes:
+        return []
+
+    rects = [(x, y, x + w, y + h) for (x, y, w, h) in boxes]
+    hs = np.array([h for (_, _, _, h) in boxes], dtype=float)
+    median_h = float(np.median(hs)) if len(hs) else 0.0
+
+    x_th = max(10.0, 0.10 * median_h)
+    y_th = max(10.0, 0.10 * median_h)
+
+    # Overlap thresholds
+    y_ov_th = 0.30
+    x_ov_th = 0.30
+
+    n = len(boxes)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    for i in range(n):
+        ax1, ay1, ax2, ay2 = rects[i]
+        aw, ah = ax2 - ax1, ay2 - ay1
+
+        for j in range(i + 1, n):
+            bx1, by1, bx2, by2 = rects[j]
+            bw, bh = bx2 - bx1, by2 - by1
+
+            ov_x = min(ax2, bx2) - max(ax1, bx1)
+            ov_y = min(ay2, by2) - max(ay1, by1)
+
+            x_overlap = max(0.0, ov_x)
+            y_overlap = max(0.0, ov_y)
+
+            gap_x = 0.0 if ov_x >= 0 else -ov_x
+            gap_y = 0.0 if ov_y >= 0 else -ov_y
+
+            x_overlap_ratio = x_overlap / max(1.0, min(aw, bw))
+            y_overlap_ratio = y_overlap / max(1.0, min(ah, bh))
+
+            close_side_by_side = (gap_x <= x_th) and (y_overlap_ratio >= y_ov_th)
+            close_stacked = (gap_y <= y_th) and (x_overlap_ratio >= x_ov_th)
+
+            if close_side_by_side or close_stacked:
+                union(i, j)
+
+    groups = {}
+    for i, b in enumerate(boxes):
+        r = find(i)
+        groups.setdefault(r, []).append(b)
+
     merged = []
-    curr_x, curr_y, curr_w, curr_h = boxes[0]
-    
-    for i in range(1, len(boxes)):
-        next_x, next_y, next_w, next_h = boxes[i]
-        
-        dist_x = next_x - (curr_x + curr_w)
-        is_close_x = dist_x < distance_threshold
-        
-        curr_cy = curr_y + curr_h / 2
-        next_cy = next_y + next_h / 2
-        is_aligned_y = abs(curr_cy - next_cy) < 30 
-        
-        is_contained = (next_x >= curr_x and (next_x + next_w) <= (curr_x + curr_w + 10))
-        
-        if (is_close_x and is_aligned_y) or is_contained:
-            min_x = min(curr_x, next_x)
-            min_y = min(curr_y, next_y)
-            max_x = max(curr_x + curr_w, next_x + next_w)
-            max_y = max(curr_y + curr_h, next_y + next_h)
-            curr_x, curr_y, curr_w, curr_h = min_x, min_y, max_x - min_x, max_y - min_y
-        else:
-            merged.append((curr_x, curr_y, curr_w, curr_h))
-            curr_x, curr_y, curr_w, curr_h = next_x, next_y, next_w, next_h
-            
-    merged.append((curr_x, curr_y, curr_w, curr_h))
+    for g in groups.values():
+        x1 = min(x for x, y, w, h in g)
+        y1 = min(y for x, y, w, h in g)
+        x2 = max(x + w for x, y, w, h in g)
+        y2 = max(y + h for x, y, w, h in g)
+        merged.append((x1, y1, x2 - x1, y2 - y1))
+
+    # Basic sorting by x
+    merged.sort(key=lambda b: b[0])
     return merged
 
+
+def filter_merged_boxes(merged_boxes):
+    if not merged_boxes:
+        return []
+
+    hs = np.array([h for x, y, w, h in merged_boxes], dtype=float)
+    areas = np.array([w * h for x, y, w, h in merged_boxes], dtype=float)
+
+    med_h = float(np.median(hs))
+    med_a = float(np.median(areas))
+
+    kept = []
+    for x, y, w, h in merged_boxes:
+        a = w * h
+        # Basic garbage filter
+        if h < 0.35 * med_h and a < 0.10 * med_a:
+            continue
+        kept.append((x, y, w, h))
+
+    kept.sort(key=lambda b: b[0])
+    return kept
+
+
 def preprocess_image(img_path):
-    if not os.path.exists(img_path): sys.exit(f"File not found.")
+    if not os.path.exists(img_path):
+        print("File not found.")
+        return None, [], [], {}
+        
     img = cv2.imread(img_path)
-    if img is None: sys.exit("Read error.")
+    if img is None:
+        print("Read error.")
+        return None, [], [], {}
 
     # 1. Grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # 2. CLAHE (Contrast Boosting) - Crucial for faint pencil lines
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+
+    # 2. AUTO-INVERT (The new addition)
+    gray = auto_invert_to_paper_mode(gray)
+
+    # 3. CLAHE (Contrast Boost)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     gray_boosted = clahe.apply(gray)
-    
-    # 3. Aggressive Denoising
+
+    # 4. Denoise
     denoised = cv2.fastNlMeansDenoising(gray_boosted, None, 30, 7, 21)
-    
-    # 4. Adaptive Thresholding (Handles shadows/gradients)
-    thresh = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                   cv2.THRESH_BINARY_INV, 15, 8)
-    
-    # 5. Connection Pass (Vertical Glue)
-    # Connects broken parts of '5', 'T', 'E'
-    kernel_connect = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 5))
-    thresh_connected = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_connect)
-    
-    # 6. Clean Noise (Speckle Removal)
-    kernel_clean = np.ones((2,2), np.uint8)
+
+    # 5. Adaptive Threshold
+    thresh = cv2.adaptiveThreshold(
+        denoised,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        15,
+        8,
+    )
+
+    # 6. Morphological Connection & Cleaning
+    kernel_v = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 5))
+    kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 2))
+    thresh_connected = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_v)
+    thresh_connected = cv2.morphologyEx(thresh_connected, cv2.MORPH_CLOSE, kernel_h)
+
+    kernel_clean = np.ones((2, 2), np.uint8)
     thresh_clean = cv2.morphologyEx(thresh_connected, cv2.MORPH_OPEN, kernel_clean)
 
-    # 7. Contours & Boxes
-    contours, _ = cv2.findContours(thresh_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    all_boxes = [cv2.boundingRect(c) for c in contours]
-    
-    # 8. Filter Noise (Size Check)
-    clean_boxes = []
-    for (x,y,w,h) in all_boxes:
-        if w > 4 and h > 10: clean_boxes.append((x,y,w,h))
-            
-    # 9. Merge Logic (Combine fragmented letters)
-    merged_boxes = merge_close_boxes(clean_boxes, distance_threshold=15)
-    
+    debug_artifacts = {
+        "original": img,
+        "binary_clean": thresh_clean
+    }
+
+    # 7. CCA & Box merging
+    img_h, img_w = thresh_clean.shape
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(thresh_clean, connectivity=8)
+
+    img_area = img_h * img_w
+    min_area = max(30, int(0.00002 * img_area))
+
+    comp_boxes = []
+    for i in range(1, num):
+        x, y, w, h, area = stats[i]
+        if area < min_area: continue
+        if w <= 4 or h <= 10: continue
+        comp_boxes.append((x, y, w, h))
+
+    merged_boxes = merge_component_boxes(comp_boxes)
+    merged_boxes = filter_merged_boxes(merged_boxes)
+
     valid_crops, valid_coords = [], []
-    img_h, img_w = thresh.shape
-    
+
     for (x, y, w, h) in merged_boxes:
-        if w > h * 6: continue # Skip long lines
-        
-        # Add Padding (Don't cut the ink edge)
+        if w > h * 6: continue # Skip obviously long horizontal lines
+
         pad = 8
-        x1 = max(0, x - pad); y1 = max(0, y - pad)
-        x2 = min(img_w, x + w + pad); y2 = min(img_h, y + h + pad)
-        
-        # Crop from the Clean Threshold
-        roi = thresh[y1:y2, x1:x2]
-        
-        # 10. Standardize Thickness (Skeleton -> Regrow)
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(img_w, x + w + pad)
+        y2 = min(img_h, y + h + pad)
+
+        roi = thresh_clean[y1:y2, x1:x2]
+
+        # 8. THE MAGIC NORMALIZER (Restored)
+        # Resizes to 64px, skeletonizes, and regrows. 
+        # This removes noise and normalizes stroke width.
         roi = standardize_stroke_width(roi)
-        
-        if cv2.countNonZero(roi) == 0: continue
 
-        # Resize & Normalize
-        roi = roi.astype('float32') / 255.0
-        roi = smart_resize_pad(roi, size=28)
-        
-        # Binary Force (0 or 1, no grays)
-        roi[roi > 0.2] = 1.0; roi[roi <= 0.2] = 0.0 
-        roi = (roi - 0.5) / 0.5
-        
-        valid_crops.append(roi)
+        if cv2.countNonZero(roi) == 0:
+            continue
+
+        # 9. Smart Resize to 28x28
+        roi_28 = smart_resize_pad(roi, size=28) 
+
+        # 10. Normalize for Model
+        roi_28 = (roi_28 > 0).astype(np.float32)
+        roi_28 = (roi_28 - 0.5) / 0.5
+
+        valid_crops.append(roi_28)
         valid_coords.append((x, y, w, h))
-        
-    return img, valid_crops, valid_coords
 
-def recognize_text(image_path):
-    model = load_model()
-    original_img, crops, coords = preprocess_image(image_path)
-    result_text = ""
-    print(f"Found {len(crops)} chars. Reading...")
+    # Basic sorting top-down
+    valid = list(zip(valid_coords, valid_crops))
+    valid.sort(key=lambda t: t[0][0]) # Sort by X first
+    # (A robust sorter would sort by Y then X, but we stick to original for now)
     
-    # DEBUG: View inputs
-    if len(crops) > 0:
-        debug_cols = min(len(crops), 15)
-        plt.figure(figsize=(15, 2))
-        for i in range(debug_cols):
-            plt.subplot(1, debug_cols, i+1)
-            plt.imshow(crops[i], cmap='gray')
-            plt.axis('off')
-            plt.title(f"#{i+1}")
-        plt.suptitle("Input to AI (Processed)")
-        plt.show(block=False)
-        plt.pause(0.5)
+    if valid:
+        valid_coords, valid_crops = zip(*valid)
+        valid_coords, valid_crops = list(valid_coords), list(valid_crops)
+    else:
+        valid_coords, valid_crops = [], []
 
-    for i, crop in enumerate(crops):
-        tensor_img = torch.tensor(crop).unsqueeze(0).unsqueeze(0).to(DEVICE)
-        with torch.no_grad(): _, embedding = model(tensor_img)
+    return img, valid_crops, valid_coords, debug_artifacts
+
+
+def run_pipeline():
+    try:
+        model = load_model()
+    except Exception as e:
+        print(f"Failed to load model: {e}")
+        return
+
+    if not os.path.exists(TEST_DIR):
+        print(f"Test directory not found at: {TEST_DIR}")
+        return
+    
+    if not os.path.exists(OUT_DIR):
+        os.makedirs(OUT_DIR)
+
+    image_files = []
+    for ext in ['*.png', '*.jpg', '*.jpeg', '*.bmp']:
+        image_files.extend(glob.glob(os.path.join(TEST_DIR, ext)))
+
+    print(f"Found {len(image_files)} images in {TEST_DIR}")
+
+    for img_path in image_files:
+        filename = os.path.basename(img_path)
+        base_name = os.path.splitext(filename)[0]
         
-        vector_list = embedding.cpu().numpy()[0].tolist()
-        results = search_qdrant_http(vector_list)
+        current_out_dir = os.path.join(OUT_DIR, base_name)
+        crops_dir = os.path.join(current_out_dir, "crops")
+        os.makedirs(crops_dir, exist_ok=True)
+
+        print(f"Processing {filename}...")
         
-        char, color = "?", (0, 0, 255)
-        if results and results[0]['score'] > 0.45:
-            char = results[0]['payload']['character']
-            color = (0, 255, 0)
+        original_img, crops, coords, debug_artifacts = preprocess_image(img_path)
+        
+        if original_img is None:
+            continue
+
+        # Save Debug Images
+        cv2.imwrite(os.path.join(current_out_dir, "00_original.png"), debug_artifacts['original'])
+        cv2.imwrite(os.path.join(current_out_dir, "01_binary_clean.png"), debug_artifacts['binary_clean'])
+
+        result_text = ""
+        inference_data = []
+
+        print(f"  > Found {len(crops)} chars. Inferring...")
+
+        annotated_img = original_img.copy()
+
+        for i, crop in enumerate(crops):
+            # Convert crop back to uint8 0-255 for saving
+            debug_crop_view = ((crop * 0.5 + 0.5) * 255).astype(np.uint8)
             
-        result_text += char
-        x, y, w, h = coords[i]
-        cv2.rectangle(original_img, (x, y), (x+w, y+h), color, 2)
-        cv2.putText(original_img, char, (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            tensor_img = torch.tensor(crop).unsqueeze(0).unsqueeze(0).to(DEVICE)
+            
+            with torch.no_grad():
+                _, embedding = model(tensor_img)
 
-    print(f"\nRAW OCR: {result_text}")
-    
-    final_text = result_text
-    display_text = f"Raw: {result_text}"
-    
-    plt.figure(figsize=(10, 6))
-    plt.imshow(cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB))
-    plt.title(display_text, fontsize=14, color='blue')
-    plt.axis('off')
-    plt.show()
+            vector_list = embedding.cpu().numpy()[0].tolist()
+            results = search_qdrant_http(vector_list)
+
+            char, color = "?", (0, 0, 255)
+            score = 0.0
+            
+            if results:
+                score = results[0].get("score", 0.0)
+                if score > 0.45:
+                    payload = results[0].get("payload") or {}
+                    char = payload.get("character", "?")
+                    color = (0, 255, 0)
+
+            result_text += char
+            x, y, w, h = coords[i]
+
+            char_filename = f"char_{i:03d}_pred_{char if char.isalnum() else 'unk'}.png"
+            cv2.imwrite(os.path.join(crops_dir, char_filename), debug_crop_view)
+
+            inference_data.append({
+                "index": i,
+                "bbox": [int(x), int(y), int(w), int(h)],
+                "prediction": char,
+                "score": float(score)
+            })
+
+            cv2.rectangle(annotated_img, (x, y), (x + w, y + h), color, 2)
+            cv2.putText(
+                annotated_img,
+                char,
+                (x, max(0, y - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                color,
+                2,
+            )
+
+        print(f"  > Result: {result_text}")
+        
+        with open(os.path.join(current_out_dir, "inference_data.json"), "w") as f:
+            json.dump({
+                "filename": filename,
+                "full_text": result_text,
+                "characters": inference_data
+            }, f, indent=4)
+
+        cv2.imwrite(os.path.join(current_out_dir, "02_result_overlay.png"), annotated_img)
+        print(f"  > Saved debug data to {current_out_dir}")
+
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1: recognize_text(sys.argv[1])
-    else: print("Usage: python -m src.infer <image_path>")
+    run_pipeline()

@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NeuroOCR Pipeline Visualization</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: 'Courier New', Courier, monospace;
+            color: #00ff00;
+            background:
+                radial-gradient(circle at 0% 0%, #052012 0, #020202 40%, #000000 100%);
+        }
+
+        #ui-layer {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            width: 360px;
+            background: rgba(0, 20, 0, 0.85);
+            border: 1px solid #00ff00;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 20px rgba(0, 255, 0, 0.2);
+            pointer-events: none;
+            backdrop-filter: blur(4px);
+        }
+
+        h1 {
+            margin: 0 0 10px 0;
+            font-size: 24px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            text-shadow: 0 0 10px #00ff00;
+        }
+
+        h2 {
+            font-size: 14px;
+            color: #ccffcc;
+            border-bottom: 1px solid #004400;
+            padding-bottom: 5px;
+            margin-bottom: 15px;
+        }
+
+        .step {
+            opacity: 0.3;
+            transition:
+                opacity 0.5s ease,
+                transform 0.4s ease,
+                border-left-color 0.4s ease;
+            margin-bottom: 10px;
+            padding-left: 10px;
+            border-left: 2px solid transparent;
+            position: relative;
+        }
+
+        .step.active {
+            opacity: 1;
+            border-left: 2px solid #00ff00;
+            text-shadow: 0 0 5px #00ff00;
+            font-weight: bold;
+            transform: translateX(4px);
+        }
+
+        .description {
+            font-size: 12px;
+            color: #aaa;
+            margin-top: 2px;
+        }
+
+        #progress-bar {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            height: 4px;
+            background: linear-gradient(90deg, #00ff00, #00ffaa);
+            width: 0%;
+            box-shadow: 0 0 10px rgba(0, 255, 140, 0.6);
+            transition: width 0.08s linear;
+        }
+
+        #hint {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.65);
+            border: 1px solid #004400;
+            border-radius: 4px;
+            padding: 6px 10px;
+            font-size: 10px;
+            color: #aaffaa;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            pointer-events: none;
+            box-shadow: 0 0 10px rgba(0, 255, 0, 0.15);
+        }
+
+        #credit {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            font-size: 10px;
+            color: #444;
+            text-align: right;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <h1>NeuroOCR</h1>
+        <h2>Inference Pipeline Visualization</h2>
+
+        <div id="step-1" class="step">
+            1. Raw Input
+            <div class="description">Handwritten image (noisy, rotated, messy).</div>
+        </div>
+        <div id="step-2" class="step">
+            2. Spatial Transformer (STN)
+            <div class="description">Virtual cameraman stabilizes, rotates and zooms the region of interest.</div>
+        </div>
+        <div id="step-3" class="step">
+            3. ResNet Feature Extraction
+            <div class="description">Deep CNN layers propagate edges, strokes and shapes forward.</div>
+        </div>
+        <div id="step-4" class="step">
+            4. Vector Embedding
+            <div class="description">Image collapses into a 256D latent vector (the glowing sphere).</div>
+        </div>
+        <div id="step-5" class="step">
+            5. Qdrant Vector Search
+            <div class="description">The vector flies into a high-dimensional cloud to find its nearest neighbor.</div>
+        </div>
+    </div>
+
+    <div id="progress-bar"></div>
+    <div id="hint">SPACE – pause / resume · Move mouse to orbit view</div>
+    <div id="credit">Powered by Three.js · NeuroOCR pipeline demo</div>
+
+    <!-- Import Three.js as a Module -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+
+        // --- SCENE SETUP ---
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x020403, 0.035);
+
+        const camera = new THREE.PerspectiveCamera(
+            60,
+            window.innerWidth / window.innerHeight,
+            0.1,
+            1000
+        );
+        const baseCameraPos = new THREE.Vector3(0, 2, 18);
+        camera.position.copy(baseCameraPos);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setClearColor(0x000000);
+        document.body.appendChild(renderer.domElement);
+
+        // --- POST PROCESSING (BLOOM/NEON EFFECT) ---
+        const renderScene = new RenderPass(scene, camera);
+        const bloomPass = new UnrealBloomPass(
+            new THREE.Vector2(window.innerWidth, window.innerHeight),
+            1.5,
+            0.4,
+            0.85
+        );
+        bloomPass.threshold = 0;
+        bloomPass.strength = 1.4; // Neon intensity
+        bloomPass.radius = 0.3;
+
+        const composer = new EffectComposer(renderer);
+        composer.addPass(renderScene);
+        composer.addPass(bloomPass);
+
+        // --- UTILS ---
+        const clock = new THREE.Clock();
+        let globalTime = 0;
+        let cycleTime = 0;
+        const cycleDuration = 16; // seconds per full pipeline loop
+
+        function easeInOutQuad(t) {
+            return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+        }
+
+        function saturate(t) {
+            return Math.min(1, Math.max(0, t));
+        }
+
+        let currentStep = 0;
+        function highlightStep(stepNum) {
+            if (currentStep === stepNum) return;
+            currentStep = stepNum;
+            document.querySelectorAll('.step').forEach(el => el.classList.remove('active'));
+            const el = document.getElementById(`step-${stepNum}`);
+            if (el) el.classList.add('active');
+        }
+
+        // --- CAMERA PARALLAX ---
+        const mouseTarget = new THREE.Vector2(0, 0);
+        const mouseCurrent = new THREE.Vector2(0, 0);
+
+        window.addEventListener('pointermove', (event) => {
+            const x = (event.clientX / window.innerWidth) * 2 - 1;
+            const y = (event.clientY / window.innerHeight) * 2 - 1;
+            mouseTarget.set(x, -y);
+        });
+
+        let isPaused = false;
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                e.preventDefault();
+                isPaused = !isPaused;
+            }
+        });
+
+        // --- ASSETS GENERATION (Procedural Texture) ---
+        function createHandwritingTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256;
+            canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+
+            // Background
+            ctx.fillStyle = 'black';
+            ctx.fillRect(0, 0, 256, 256);
+
+            // Slight paper noise
+            const imgData = ctx.getImageData(0, 0, 256, 256);
+            for (let i = 0; i < imgData.data.length; i += 4) {
+                const noise = (Math.random() - 0.5) * 20;
+                imgData.data[i] = noise;
+                imgData.data[i + 1] = noise;
+                imgData.data[i + 2] = noise;
+            }
+            ctx.putImageData(imgData, 0, 0);
+
+            // "Handwriting"
+            ctx.strokeStyle = 'white';
+            ctx.lineWidth = 15;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+
+            ctx.beginPath();
+            // A messy 'A'
+            ctx.moveTo(50, 200);
+            ctx.lineTo(128, 50);
+            ctx.lineTo(206, 200);
+            ctx.moveTo(80, 140);
+            ctx.lineTo(176, 140);
+            ctx.stroke();
+
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.anisotropy = 8;
+            return tex;
+        }
+
+        // --- OBJECTS ---
+
+        // 1. Input Image Plane
+        const geometryImage = new THREE.PlaneGeometry(4, 4);
+        const materialImage = new THREE.MeshBasicMaterial({
+            map: createHandwritingTexture(),
+            side: THREE.DoubleSide,
+            transparent: true,
+            opacity: 0.0
+        });
+        const inputImage = new THREE.Mesh(geometryImage, materialImage);
+        inputImage.position.set(-10, 0, 0);
+        inputImage.rotation.z = Math.PI / 6; // Start rotated (messy input)
+        scene.add(inputImage);
+
+        // 2. STN frame (virtual crop box)
+        const stnFrameGeo = new THREE.PlaneGeometry(4.3, 4.3);
+        const stnFrameMat = new THREE.MeshBasicMaterial({
+            color: 0x00ff00,
+            wireframe: true,
+            transparent: true,
+            opacity: 0
+        });
+        const stnFrame = new THREE.Mesh(stnFrameGeo, stnFrameMat);
+        stnFrame.position.copy(inputImage.position);
+        scene.add(stnFrame);
+
+        // 3. ResNet Layers (Wireframe Boxes)
+        const layers = [];
+        const inactiveColor = new THREE.Color(0x004400);
+        const activeColor = new THREE.Color(0x00ff88);
+
+        for (let i = 0; i < 3; i++) {
+            const geo = new THREE.BoxGeometry(4, 4, 0.5);
+            const edges = new THREE.EdgesGeometry(geo);
+            const mat = new THREE.LineBasicMaterial({
+                color: inactiveColor.clone()
+            });
+            const line = new THREE.LineSegments(edges, mat);
+            line.position.set(-3 + i * 3, 0, 0);
+            line.visible = false;
+            line.userData.inactiveColor = inactiveColor.clone();
+            line.userData.activeColor = activeColor.clone();
+            layers.push(line);
+            scene.add(line);
+        }
+
+        // 4. The Vector (Glowing Orb)
+        const geoOrb = new THREE.IcosahedronGeometry(0.7, 2);
+        const matOrb = new THREE.MeshBasicMaterial({
+            color: 0x00ff99,
+            wireframe: true
+        });
+        const vectorOrb = new THREE.Mesh(geoOrb, matOrb);
+        vectorOrb.visible = false;
+        scene.add(vectorOrb);
+
+        // Embedding anchor (end of ResNet)
+        const embeddingPos = new THREE.Vector3(4, 0, 0);
+
+        // 5. Qdrant Cloud (Particle System)
+        const particlesGeo = new THREE.BufferGeometry();
+        const particlesCount = 700;
+        const posArray = new Float32Array(particlesCount * 3);
+
+        // Target location in the cloud
+        const targetPos = new THREE.Vector3(12, 0, 0);
+
+        for (let i = 0; i < particlesCount * 3; i += 3) {
+            posArray[i] = targetPos.x + (Math.random() - 0.5) * 10;   // X
+            posArray[i + 1] = targetPos.y + (Math.random() - 0.5) * 8; // Y
+            posArray[i + 2] = targetPos.z + (Math.random() - 0.5) * 8; // Z
+        }
+        particlesGeo.setAttribute('position', new THREE.BufferAttribute(posArray, 3));
+        const particlesMat = new THREE.PointsMaterial({
+            size: 0.08,
+            color: 0x005500,
+            transparent: true,
+            opacity: 0.9
+        });
+        const cloud = new THREE.Points(particlesGeo, particlesMat);
+        scene.add(cloud);
+
+        // The "Match" highlight
+        const matchGeo = new THREE.SphereGeometry(0.35, 24, 24);
+        const matchMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+        const matchPoint = new THREE.Mesh(matchGeo, matchMat);
+        matchPoint.position.copy(targetPos);
+        matchPoint.visible = false;
+        scene.add(matchPoint);
+
+        // Connection Line
+        const lineGeo = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(0, 0, 0),
+            new THREE.Vector3(0, 0, 0)
+        ]);
+        const lineMat = new THREE.LineBasicMaterial({ color: 0x00ff00 });
+        const connectionLine = new THREE.Line(lineGeo, lineMat);
+        scene.add(connectionLine);
+
+        // --- ANIMATION LOOP ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+            globalTime += delta;
+            if (!isPaused) {
+                cycleTime = (cycleTime + delta) % cycleDuration;
+            }
+            const progress = cycleTime / cycleDuration;
+
+            // Update progress bar
+            const progressBar = document.getElementById('progress-bar');
+            if (progressBar) {
+                progressBar.style.width = (progress * 100).toFixed(2) + '%';
+            }
+
+            // Smooth camera orbit based on mouse
+            mouseCurrent.lerp(mouseTarget, 0.06);
+            camera.position.x = baseCameraPos.x + mouseCurrent.x * 4;
+            camera.position.y = baseCameraPos.y + mouseCurrent.y * 2;
+            camera.lookAt(0, 0, 0);
+
+            // Global small motions
+            cloud.rotation.y += 0.005;
+            vectorOrb.rotation.y += 0.01;
+            vectorOrb.rotation.x += 0.005;
+
+            // Reset visibility
+            inputImage.visible = false;
+            stnFrame.visible = false;
+            layers.forEach(l => (l.visible = false));
+            vectorOrb.visible = false;
+            matchPoint.visible = false;
+            connectionLine.visible = false;
+
+            // --- STAGE 1: INPUT (0 - 15%) ---
+            if (progress < 0.15) {
+                highlightStep(1);
+                const tNorm = progress / 0.15;
+                const t = easeInOutQuad(tNorm);
+
+                inputImage.visible = true;
+                inputImage.position.set(
+                    THREE.MathUtils.lerp(-14, -10, t),
+                    0,
+                    0
+                );
+                inputImage.rotation.z = THREE.MathUtils.lerp(
+                    Math.PI / 3,
+                    Math.PI / 6,
+                    t
+                );
+                const s = THREE.MathUtils.lerp(0.3, 1.0, t);
+                inputImage.scale.set(s, s, 1);
+                materialImage.opacity = THREE.MathUtils.lerp(0.0, 1.0, t);
+            }
+            // --- STAGE 2: STN (15% - 30%) ---
+            else if (progress < 0.30) {
+                highlightStep(2);
+                const tNorm = (progress - 0.15) / 0.15;
+                const t = easeInOutQuad(tNorm);
+
+                inputImage.visible = true;
+                inputImage.position.set(
+                    THREE.MathUtils.lerp(-10, -9, t),
+                    0,
+                    0
+                );
+                inputImage.rotation.z = THREE.MathUtils.lerp(
+                    Math.PI / 6,
+                    0,
+                    t
+                );
+                inputImage.scale.setScalar(0.95 + 0.05 * Math.sin(globalTime * 2));
+                materialImage.opacity = 1.0;
+
+                stnFrame.visible = true;
+                stnFrame.position.copy(inputImage.position);
+                stnFrame.rotation.z = inputImage.rotation.z;
+                stnFrame.rotation.y = THREE.MathUtils.lerp(-0.6, 0.0, t);
+                stnFrame.scale.setScalar(THREE.MathUtils.lerp(1.25, 1.0, t));
+                stnFrameMat.opacity = t;
+            }
+            // --- STAGE 3: RESNET (30% - 50%) ---
+            else if (progress < 0.50) {
+                highlightStep(3);
+                const tNorm = (progress - 0.30) / 0.20;
+                const t = easeInOutQuad(tNorm);
+
+                inputImage.visible = true;
+                materialImage.opacity = 1.0;
+                inputImage.rotation.z = 0;
+                inputImage.position.x = THREE.MathUtils.lerp(-9, 4, t);
+                inputImage.scale.setScalar(0.85);
+
+                layers.forEach((layer, i) => {
+                    layer.visible = true;
+                    layer.position.set(-3 + i * 3, 0, 0);
+                    const s = 1 + 0.05 * Math.sin(globalTime * 2 + i);
+                    layer.scale.set(s, s, s);
+
+                    const activationPoint = [0.15, 0.5, 0.85][i];
+                    const act = saturate((t - activationPoint + 0.25) / 0.25);
+                    const color = layer.material.color;
+                    color.copy(layer.userData.inactiveColor);
+                    color.lerp(layer.userData.activeColor, act);
+                });
+            }
+            // --- STAGE 4: EMBEDDING (50% - 70%) ---
+            else if (progress < 0.70) {
+                highlightStep(4);
+                const tNorm = (progress - 0.50) / 0.20;
+                const t = easeInOutQuad(tNorm);
+
+                layers.forEach(l => (l.visible = true));
+
+                vectorOrb.visible = true;
+                vectorOrb.position.copy(embeddingPos);
+                const orbScale = THREE.MathUtils.lerp(0.7, 1.3, t);
+                vectorOrb.scale.setScalar(
+                    orbScale + 0.05 * Math.sin(globalTime * 3)
+                );
+
+                if (t < 0.6) {
+                    const k = 1 - t / 0.6;
+                    inputImage.visible = true;
+                    inputImage.position.x = THREE.MathUtils.lerp(4, 4.2, t);
+                    inputImage.scale.setScalar(0.85 * k);
+                    materialImage.opacity = k;
+                } else {
+                    inputImage.visible = false;
+                    materialImage.opacity = 0;
+                }
+            }
+            // --- STAGE 5: QDRANT SEARCH (70% - 100%) ---
+            else {
+                highlightStep(5);
+                const tNorm = (progress - 0.70) / 0.30;
+                const t = easeInOutQuad(tNorm);
+
+                vectorOrb.visible = true;
+                vectorOrb.position.lerpVectors(embeddingPos, targetPos, t);
+
+                // Cloud reacts to the query
+                particlesMat.size = 0.08 + 0.04 * Math.sin(globalTime * 2 + t * Math.PI);
+
+                if (t > 0.25) {
+                    connectionLine.visible = true;
+                    const positions = connectionLine.geometry.attributes.position.array;
+                    positions[0] = vectorOrb.position.x;
+                    positions[1] = vectorOrb.position.y;
+                    positions[2] = vectorOrb.position.z;
+                    positions[3] = targetPos.x;
+                    positions[4] = targetPos.y;
+                    positions[5] = targetPos.z;
+                    connectionLine.geometry.attributes.position.needsUpdate = true;
+                }
+
+                if (t > 0.70) {
+                    matchPoint.visible = true;
+                    const pulse = 1 + 0.4 * Math.sin(globalTime * 5);
+                    matchPoint.scale.setScalar(pulse);
+                    matchMat.color.setHex(0x00ffcc);
+                }
+            }
+
+            composer.render();
+        }
+
+        // Handle Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>

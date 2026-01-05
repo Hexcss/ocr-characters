@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NeuroOCR Model Architecture Visualization</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: 'Courier New', Courier, monospace;
+            color: #00ff00;
+            background:
+                radial-gradient(circle at 0% 0%, #052012 0, #020202 40%, #000000 100%);
+        }
+
+        #ui-layer {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            width: 380px;
+            background: rgba(0, 20, 0, 0.85);
+            border: 1px solid #00ff00;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 20px rgba(0, 255, 0, 0.2);
+            pointer-events: none;
+            backdrop-filter: blur(4px);
+        }
+
+        h1 {
+            margin: 0 0 10px 0;
+            font-size: 24px;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            text-shadow: 0 0 10px #00ff00;
+        }
+
+        h2 {
+            font-size: 14px;
+            color: #ccffcc;
+            border-bottom: 1px solid #004400;
+            padding-bottom: 5px;
+            margin-bottom: 15px;
+        }
+
+        .step {
+            opacity: 0.3;
+            transition:
+                opacity 0.4s ease,
+                transform 0.4s ease,
+                border-left-color 0.4s ease;
+            margin-bottom: 10px;
+            padding-left: 10px;
+            border-left: 2px solid transparent;
+            position: relative;
+        }
+
+        .step.active {
+            opacity: 1;
+            border-left: 2px solid #00ff00;
+            text-shadow: 0 0 5px #00ff00;
+            font-weight: bold;
+            transform: translateX(4px);
+        }
+
+        .description {
+            font-size: 12px;
+            color: #aaa;
+            margin-top: 2px;
+        }
+
+        #progress-bar {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            height: 4px;
+            background: linear-gradient(90deg, #00ff00, #00ffaa);
+            width: 0%;
+            box-shadow: 0 0 10px rgba(0, 255, 140, 0.6);
+            transition: width 0.08s linear;
+        }
+
+        #hint {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.65);
+            border: 1px solid #004400;
+            border-radius: 4px;
+            padding: 6px 10px;
+            font-size: 10px;
+            color: #aaffaa;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+            pointer-events: none;
+            box-shadow: 0 0 10px rgba(0, 255, 0, 0.15);
+        }
+
+        #credit {
+            position: absolute;
+            bottom: 10px;
+            right: 10px;
+            font-size: 10px;
+            color: #444;
+            text-align: right;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <h1>NeuroOCR</h1>
+        <h2>Model Architecture Visualization</h2>
+
+        <div id="step-1" class="step">
+            1. Input & STN Overview
+            <div class="description">
+                28×28 grayscale goes into a Spatial Transformer Network (localization CNN + affine grid).
+            </div>
+        </div>
+        <div id="step-2" class="step">
+            2. Spatial Transformer Network (STN)
+            <div class="description">
+                The localization conv layers predict 2×3 θ; <code>grid_sample</code> stabilizes and centers the digits.
+            </div>
+        </div>
+        <div id="step-3" class="step">
+            3. Residual Backbone
+            <div class="description">
+                <code>conv_in</code> + 3 ResidualBlocks (GELU + BatchNorm, skip paths) build deep feature maps.
+            </div>
+        </div>
+        <div id="step-4" class="step">
+            4. Dense + Dropout + Embedding
+            <div class="description">
+                Features flatten → <code>fc_features</code> → dropout → embedding_head → L2-normalized vector.
+            </div>
+        </div>
+        <div id="step-5" class="step">
+            5. Classifier Head
+            <div class="description">
+                The embedding feeds a linear classifier (<code>classifier</code>) to output class logits.
+            </div>
+        </div>
+    </div>
+
+    <div id="progress-bar"></div>
+    <div id="hint">SPACE – pause / resume · Move mouse to orbit view</div>
+    <div id="credit">NeuroOCR · STN + Residual CNN + Embedding · Visualized with Three.js</div>
+
+    <!-- Import Three.js as a Module -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+
+        // --- SCENE SETUP ---
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x020403, 0.035);
+
+        const camera = new THREE.PerspectiveCamera(
+            60,
+            window.innerWidth / window.innerHeight,
+            0.1,
+            1000
+        );
+        const baseCameraPos = new THREE.Vector3(2, 3, 20);
+        camera.position.copy(baseCameraPos);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.setClearColor(0x000000);
+        document.body.appendChild(renderer.domElement);
+
+        // --- POST PROCESSING (BLOOM/NEON EFFECT) ---
+        const renderScene = new RenderPass(scene, camera);
+        const bloomPass = new UnrealBloomPass(
+            new THREE.Vector2(window.innerWidth, window.innerHeight),
+            1.6,
+            0.4,
+            0.85
+        );
+        bloomPass.threshold = 0;
+        bloomPass.strength = 1.4;
+        bloomPass.radius = 0.4;
+
+        const composer = new EffectComposer(renderer);
+        composer.addPass(renderScene);
+        composer.addPass(bloomPass);
+
+        // --- UTILS ---
+        const clock = new THREE.Clock();
+        let globalTime = 0;
+        let cycleTime = 0;
+        const cycleDuration = 18; // seconds per loop
+
+        function easeInOutQuad(t) {
+            return t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+        }
+
+        function saturate(t) {
+            return Math.min(1, Math.max(0, t));
+        }
+
+        let currentStep = 0;
+        function highlightStep(stepNum) {
+            if (currentStep === stepNum) return;
+            currentStep = stepNum;
+            document.querySelectorAll('.step').forEach(el => el.classList.remove('active'));
+            const el = document.getElementById(`step-${stepNum}`);
+            if (el) el.classList.add('active');
+        }
+
+        // --- CAMERA PARALLAX ---
+        const mouseTarget = new THREE.Vector2(0, 0);
+        const mouseCurrent = new THREE.Vector2(0, 0);
+
+        window.addEventListener('pointermove', (event) => {
+            const x = (event.clientX / window.innerWidth) * 2 - 1;
+            const y = (event.clientY / window.innerHeight) * 2 - 1;
+            mouseTarget.set(x, -y);
+        });
+
+        let isPaused = false;
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                e.preventDefault();
+                isPaused = !isPaused;
+            }
+        });
+
+        // --- 2D TEXTURES (Input & Feature Map) ---
+        function createHandwritingTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256;
+            canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+
+            // Background
+            ctx.fillStyle = 'black';
+            ctx.fillRect(0, 0, 256, 256);
+
+            // Noise
+            const imgData = ctx.getImageData(0, 0, 256, 256);
+            for (let i = 0; i < imgData.data.length; i += 4) {
+                const noise = 10 + (Math.random() - 0.5) * 20;
+                imgData.data[i] = noise;
+                imgData.data[i + 1] = noise;
+                imgData.data[i + 2] = noise;
+                imgData.data[i + 3] = 255;
+            }
+            ctx.putImageData(imgData, 0, 0);
+
+            // Messy "5"
+            ctx.strokeStyle = 'white';
+            ctx.lineWidth = 18;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+
+            ctx.beginPath();
+            ctx.moveTo(60, 70);
+            ctx.lineTo(190, 70);
+            ctx.lineTo(100, 140);
+            ctx.lineTo(190, 220);
+            ctx.stroke();
+
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.anisotropy = 8;
+            return tex;
+        }
+
+        function createFeatureMapTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 128;
+            canvas.height = 128;
+            const ctx = canvas.getContext('2d');
+
+            ctx.fillStyle = 'black';
+            ctx.fillRect(0, 0, 128, 128);
+
+            const cell = 16;
+            for (let y = 0; y < 8; y++) {
+                for (let x = 0; x < 8; x++) {
+                    const v = Math.random();
+                    const g = Math.floor(80 + v * 160);
+                    ctx.fillStyle = `rgb(${g},${g},${g})`;
+                    ctx.fillRect(x * cell + 1, y * cell + 1, cell - 2, cell - 2);
+                }
+            }
+
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.anisotropy = 4;
+            return tex;
+        }
+
+        // --- OBJECTS ---
+
+        // INPUT PLANE
+        const inputGeo = new THREE.PlaneGeometry(4, 4);
+        const inputMat = new THREE.MeshBasicMaterial({
+            map: createHandwritingTexture(),
+            side: THREE.DoubleSide,
+            transparent: true,
+            opacity: 0.0
+        });
+        const inputPlane = new THREE.Mesh(inputGeo, inputMat);
+        inputPlane.position.set(-12, 0, 0);
+        inputPlane.rotation.y = 0.5;
+        inputPlane.rotation.z = 0.4;
+        scene.add(inputPlane);
+
+        // STN PANEL (crop grid + feature map)
+        const stnFrameGeo = new THREE.PlaneGeometry(4.4, 4.4);
+        const stnFrameMat = new THREE.MeshBasicMaterial({
+            color: 0x00ff00,
+            wireframe: true,
+            transparent: true,
+            opacity: 0
+        });
+        const stnFrame = new THREE.Mesh(stnFrameGeo, stnFrameMat);
+        stnFrame.position.set(-7, 0, 0);
+        scene.add(stnFrame);
+
+        const stnFeatGeo = new THREE.PlaneGeometry(3, 3);
+        const stnFeatMat = new THREE.MeshBasicMaterial({
+            map: createFeatureMapTexture(),
+            side: THREE.DoubleSide,
+            transparent: true,
+            opacity: 0
+        });
+        const stnFeaturePlane = new THREE.Mesh(stnFeatGeo, stnFeatMat);
+        stnFeaturePlane.position.set(-7, -2, -0.5);
+        scene.add(stnFeaturePlane);
+
+        // RESIDUAL BLOCKS
+        const residualBlocks = [];
+        const skipLines = [];
+
+        const resInactiveColor = new THREE.Color(0x004400);
+        const resActiveColor = new THREE.Color(0x00ff88);
+
+        function createResidualBlock(x, index, label) {
+            const group = new THREE.Group();
+
+            const blockGeo = new THREE.BoxGeometry(3, 3, 2);
+            const blockMat = new THREE.MeshBasicMaterial({
+                color: 0x001800,
+                wireframe: true,
+                transparent: true,
+                opacity: 0.9
+            });
+            const block = new THREE.Mesh(blockGeo, blockMat);
+            group.add(block);
+
+            const skipGeo = new THREE.TubeGeometry(
+                new THREE.CatmullRomCurve3([
+                    new THREE.Vector3(-1.8, -1.5, 0),
+                    new THREE.Vector3(-1.8, -2.0, 1),
+                    new THREE.Vector3(1.8, -1.5, 0)
+                ]),
+                20,
+                0.05,
+                8,
+                false
+            );
+            const skipMat = new THREE.MeshBasicMaterial({
+                color: 0x004400,
+                wireframe: false
+            });
+            const skipMesh = new THREE.Mesh(skipGeo, skipMat);
+            group.add(skipMesh);
+
+            group.position.set(x, 0, 0);
+            group.userData = { block, skipMesh, label, index };
+            scene.add(group);
+
+            residualBlocks.push(group);
+        }
+
+        createResidualBlock(-1, 0, "ResidualBlock (32→64, stride=2)");
+        createResidualBlock(3, 1, "ResidualBlock (64→128, stride=2)");
+        createResidualBlock(7, 2, "ResidualBlock (128→256, stride=1)");
+
+        // DENSE CORE / FLATTEN + FC + DROPOUT
+        const denseCoreGeo = new THREE.TorusGeometry(1.5, 0.4, 16, 64);
+        const denseCoreMat = new THREE.MeshBasicMaterial({
+            color: 0x00aa55,
+            wireframe: true,
+            transparent: true,
+            opacity: 0.0
+        });
+        const denseCore = new THREE.Mesh(denseCoreGeo, denseCoreMat);
+        denseCore.position.set(10.5, 0, 0);
+        scene.add(denseCore);
+
+        // EMBEDDING SPHERE
+        const embedGeo = new THREE.IcosahedronGeometry(1.0, 2);
+        const embedMat = new THREE.MeshBasicMaterial({
+            color: 0x00ff99,
+            wireframe: true,
+            transparent: true,
+            opacity: 0.0
+        });
+        const embedSphere = new THREE.Mesh(embedGeo, embedMat);
+        embedSphere.position.set(13.5, 0.3, 0);
+        scene.add(embedSphere);
+
+        // Embedding radial lines (represent embedding dimensions)
+        const embedRadials = [];
+        const radialCount = 32;
+        const radialMat = new THREE.LineBasicMaterial({
+            color: 0x00ff99,
+            transparent: true,
+            opacity: 0.0
+        });
+        for (let i = 0; i < radialCount; i++) {
+            const angle = (i / radialCount) * Math.PI * 2;
+            const r0 = 0.6;
+            const r1 = 1.8;
+            const p1 = new THREE.Vector3(Math.cos(angle) * r0, 0, Math.sin(angle) * r0);
+            const p2 = new THREE.Vector3(Math.cos(angle) * r1, 0, Math.sin(angle) * r1);
+            const geo = new THREE.BufferGeometry().setFromPoints([p1, p2]);
+            const line = new THREE.Line(geo, radialMat.clone());
+            embedSphere.add(line);
+            embedRadials.push(line);
+        }
+
+        // CLASSIFIER BARS
+        const classGroup = new THREE.Group();
+        const classBars = [];
+        const numClasses = 10;
+
+        for (let i = 0; i < numClasses; i++) {
+            const geo = new THREE.BoxGeometry(0.4, 0.1, 0.4);
+            const mat = new THREE.MeshBasicMaterial({
+                color: 0x007733,
+                transparent: true,
+                opacity: 0.0
+            });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.set(0.5 * (i - numClasses / 2), -1, 0);
+            classGroup.add(mesh);
+            classBars.push(mesh);
+        }
+        classGroup.position.set(16, 0.5, 0);
+        scene.add(classGroup);
+
+        // Small glowing particles along the flow (from STN to classifier)
+        const flowParticlesGeo = new THREE.BufferGeometry();
+        const flowParticleCount = 150;
+        const flowPositions = new Float32Array(flowParticleCount * 3);
+        for (let i = 0; i < flowParticleCount * 3; i++) {
+            flowPositions[i] = 0;
+        }
+        flowParticlesGeo.setAttribute('position', new THREE.BufferAttribute(flowPositions, 3));
+        const flowParticlesMat = new THREE.PointsMaterial({
+            size: 0.08,
+            color: 0x00ff88,
+            transparent: true,
+            opacity: 0.0
+        });
+        const flowParticles = new THREE.Points(flowParticlesGeo, flowParticlesMat);
+        scene.add(flowParticles);
+
+        // --- ANIMATION LOOP ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+            globalTime += delta;
+            if (!isPaused) {
+                cycleTime = (cycleTime + delta) % cycleDuration;
+            }
+
+            const progress = cycleTime / cycleDuration;
+
+            // Update progress bar
+            const progressBar = document.getElementById('progress-bar');
+            if (progressBar) {
+                progressBar.style.width = (progress * 100).toFixed(2) + '%';
+            }
+
+            // Smooth camera
+            mouseCurrent.lerp(mouseTarget, 0.06);
+            camera.position.x = baseCameraPos.x + mouseCurrent.x * 4;
+            camera.position.y = baseCameraPos.y + mouseCurrent.y * 2;
+            camera.lookAt(2, 0, 0);
+
+            // Idle motions
+            denseCore.rotation.y += 0.5 * delta;
+            embedSphere.rotation.y += 0.6 * delta;
+            embedSphere.rotation.x += 0.25 * delta;
+
+            // Reset global visibility
+            residualBlocks.forEach(group => {
+                group.children.forEach(child => {
+                    if (child.material && child.material.color) {
+                        if (child === group.userData.skipMesh) {
+                            child.material.color.setHex(0x004400);
+                        }
+                    }
+                });
+            });
+            flowParticlesMat.opacity = 0.0;
+
+            // Stage mapping:
+            // 0.00–0.20: Step 1: Input & overview
+            // 0.20–0.40: Step 2: STN
+            // 0.40–0.65: Step 3: Residual backbone
+            // 0.65–0.85: Step 4: Dense + embedding
+            // 0.85–1.00: Step 5: Classifier
+
+            // --- STAGE 1: INPUT & OVERVIEW ---
+            if (progress < 0.20) {
+                highlightStep(1);
+                const tNorm = progress / 0.20;
+                const t = easeInOutQuad(tNorm);
+
+                // Input fades in & rotates towards camera
+                inputMat.opacity = THREE.MathUtils.lerp(0.0, 1.0, t);
+                inputPlane.rotation.z = THREE.MathUtils.lerp(0.4, 0.0, t);
+                inputPlane.position.x = THREE.MathUtils.lerp(-13.5, -12, t);
+
+                // All modules ghosted for overview
+                stnFrameMat.opacity = 0.3 * t;
+                stnFeaturePlane.material.opacity = 0.0;
+                denseCoreMat.opacity = 0.1 * t;
+                embedMat.opacity = 0.1 * t;
+                embedRadials.forEach(r => {
+                    r.material.opacity = 0.05 * t;
+                });
+                classBars.forEach(bar => {
+                    bar.material.opacity = 0.1 * t;
+                });
+            }
+            // --- STAGE 2: STN ---
+            else if (progress < 0.40) {
+                highlightStep(2);
+                const tNorm = (progress - 0.20) / 0.20;
+                const t = easeInOutQuad(tNorm);
+
+                // Input travels into STN panel and gets "stabilized"
+                inputMat.opacity = 1.0;
+                inputPlane.visible = true;
+                inputPlane.position.x = THREE.MathUtils.lerp(-12, -7, t);
+                inputPlane.rotation.y = THREE.MathUtils.lerp(0.5, 0.0, t);
+                inputPlane.rotation.z = THREE.MathUtils.lerp(0.0, 0.0, t);
+                const s = THREE.MathUtils.lerp(1.0, 0.9, t);
+                inputPlane.scale.set(s, s, 1);
+
+                // STN frame zooms and rotates slightly like a crop box
+                stnFrame.visible = true;
+                stnFrame.position.set(-7, 0, 0);
+                stnFrame.rotation.z = 0.05 * Math.sin(globalTime * 2);
+                stnFrameMat.opacity = THREE.MathUtils.lerp(0.3, 1.0, t);
+
+                // Feature map fades in (localization output)
+                stnFeaturePlane.visible = true;
+                stnFeaturePlane.material.opacity = THREE.MathUtils.lerp(0.0, 0.8, t);
+                stnFeaturePlane.position.y = THREE.MathUtils.lerp(-2.5, -1.7, t);
+
+                // Slight wavy effect as if affine grid is being predicted
+                const gridScale = 1.0 + 0.05 * Math.sin(globalTime * 3);
+                stnFrame.scale.set(gridScale, gridScale, 1);
+
+                // Flow particles from input into STN
+                flowParticlesMat.opacity = 0.6;
+                animateFlowParticles(-12, -7, 0, tNorm, 0.4);
+            }
+            // --- STAGE 3: RESIDUAL BACKBONE ---
+            else if (progress < 0.65) {
+                highlightStep(3);
+                const tNorm = (progress - 0.40) / 0.25;
+                const t = easeInOutQuad(tNorm);
+
+                // Input now sits at STN output (stabilized), then fades out
+                const fadeOut = saturate((t - 0.3) / 0.3);
+                inputPlane.position.x = -7;
+                inputPlane.rotation.set(0, 0, 0);
+                inputPlane.scale.setScalar(0.9);
+                inputMat.opacity = 1.0 - 0.9 * fadeOut;
+
+                stnFrameMat.opacity = 1.0 - 0.6 * fadeOut;
+                stnFeaturePlane.material.opacity = 0.8 - 0.6 * fadeOut;
+
+                // Residual blocks light up one after another
+                residualBlocks.forEach((group, i) => {
+                    const localProgress = saturate((t - i * 0.25) / 0.35);
+                    const pulse = 1 + 0.05 * Math.sin(globalTime * 6 + i);
+
+                    group.visible = true;
+                    group.children.forEach(child => {
+                        if (child.geometry && child.material && child.material.opacity !== undefined) {
+                            child.material.opacity = 0.4 + 0.4 * localProgress;
+                        }
+                    });
+
+                    group.scale.set(pulse, pulse, pulse);
+
+                    // Simulate main path activation (block wireframe brightening)
+                    const block = group.userData.block;
+                    if (block && block.material && block.material.color) {
+                        const c = new THREE.Color(0x001800);
+                        c.lerp(new THREE.Color(0x00ff88), localProgress);
+                        block.material.color.copy(c);
+                    }
+
+                    // Skip connection glows when residual path is strong
+                    const skip = group.userData.skipMesh;
+                    if (skip && skip.material && skip.material.color) {
+                        const act = 0.5 + 0.5 * Math.sin(globalTime * 5 + i);
+                        const c2 = new THREE.Color(0x004400);
+                        c2.lerp(new THREE.Color(0x00ff88), act * localProgress);
+                        skip.material.color.copy(c2);
+                    }
+                });
+
+                // Flow particles through residual stack
+                flowParticlesMat.opacity = 0.8;
+                animateFlowParticles(-7, 7, 0, tNorm, 0.6);
+            }
+            // --- STAGE 4: DENSE + DROPOUT + EMBEDDING ---
+            else if (progress < 0.85) {
+                highlightStep(4);
+                const tNorm = (progress - 0.65) / 0.20;
+                const t = easeInOutQuad(tNorm);
+
+                // Residual stack fades a bit to push focus rightwards
+                residualBlocks.forEach((group) => {
+                    group.children.forEach(child => {
+                        if (child.material && child.material.opacity !== undefined) {
+                            child.material.opacity = 0.8 - 0.4 * t;
+                        }
+                    });
+                });
+
+                // Dense core appears as flatten + fc_features + dropout
+                denseCore.visible = true;
+                denseCoreMat.opacity = THREE.MathUtils.lerp(0.0, 1.0, t);
+                denseCore.scale.setScalar(1.0 + 0.2 * Math.sin(globalTime * 3));
+
+                // Flow from the last residual block into dense core
+                const lastBlockX = 7;
+                flowParticlesMat.opacity = 0.8;
+                animateFlowParticles(lastBlockX, 10.5, 0, tNorm, 0.6);
+
+                // Embedding sphere grows into view
+                const eVis = saturate((t - 0.3) / 0.7);
+                embedMat.opacity = THREE.MathUtils.lerp(0.0, 0.9, eVis);
+                embedSphere.visible = true;
+                embedSphere.position.y = THREE.MathUtils.lerp(0.3, 0.0, eVis);
+                embedSphere.scale.setScalar(THREE.MathUtils.lerp(0.8, 1.2, eVis));
+
+                // Embedding radials pulse like dimensions in 128D space
+                embedRadials.forEach((line, i) => {
+                    const o = 0.2 + 0.6 * eVis * (0.5 + 0.5 * Math.sin(globalTime * 4 + i * 0.4));
+                    line.material.opacity = o;
+                });
+            }
+            // --- STAGE 5: CLASSIFIER HEAD ---
+            else {
+                highlightStep(5);
+                const tNorm = (progress - 0.85) / 0.15;
+                const t = easeInOutQuad(tNorm);
+
+                embedMat.opacity = 0.9;
+                embedSphere.scale.setScalar(1.2 + 0.1 * Math.sin(globalTime * 4));
+
+                // Flow from embedding to classifier bars
+                flowParticlesMat.opacity = 0.9;
+                animateFlowParticles(13.5, 16, 0.3, tNorm, 0.7);
+
+                // Bars rise like logits; one gets highlighted as top prediction
+                const topIndex = 3;
+                classBars.forEach((bar, i) => {
+                    const baseHeight = 0.2 + 1.2 * Math.random(); // base randomness
+                    const smoothHeight = THREE.MathUtils.lerp(0.1, baseHeight, t);
+                    bar.scale.y = smoothHeight;
+                    bar.position.y = -1 + smoothHeight / 2;
+                    bar.material.opacity = THREE.MathUtils.lerp(0.0, 0.9, t);
+
+                    if (i === topIndex) {
+                        bar.material.color.setHex(0x00ff99);
+                        bar.scale.y += 0.3 * (0.5 + 0.5 * Math.sin(globalTime * 5));
+                        bar.position.y = -1 + bar.scale.y / 2;
+                    } else {
+                        bar.material.color.setHex(0x007733);
+                    }
+                });
+            }
+
+            composer.render();
+        }
+
+        // Flow particles along a straight line between modules
+        function animateFlowParticles(xStart, xEnd, y, tNorm, spread = 0.5) {
+            const positions = flowParticles.geometry.attributes.position.array;
+            for (let i = 0; i < flowParticleCount; i++) {
+                const local = ((i / flowParticleCount) + tNorm * 1.5) % 1;
+                const x = THREE.MathUtils.lerp(xStart, xEnd, local);
+                const dy = (Math.random() - 0.5) * spread;
+                const dz = (Math.random() - 0.5) * spread;
+                positions[i * 3 + 0] = x;
+                positions[i * 3 + 1] = y + dy;
+                positions[i * 3 + 2] = dz;
+            }
+            flowParticles.geometry.attributes.position.needsUpdate = true;
+        }
+
+        // Handle Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>
