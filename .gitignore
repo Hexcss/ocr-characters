@@ -4,3 +4,4 @@ __pycache__
 *.zip
 out
 synthetic_dataset
+.vscode

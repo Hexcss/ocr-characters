@@ -118,59 +118,128 @@ class NeuroDrawApp:
 
     def get_merged_contours(self, img_np):
         """
-        Advanced heuristic: Merges dots (i, j, !, ?) with their main body.
+        Merge diacritics (ñ, á, ü, i/j dots, etc.) into their base glyph
+        so they become ONE detection box.
+
+        Strategy:
+        - Find contours -> bounding boxes
+        - Classify small-height boxes as "marks" (diacritics)
+        - Attach each mark to the best base box using:
+            * horizontal overlap
+            * mark is clearly above/below the base center (so "-" doesn't get merged)
+            * reasonable vertical gap
         """
-        contours, _ = cv2.findContours(img_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours: return []
 
-        # Convert to bounding boxes: (x, y, w, h)
+        # 1) Binarize (stable contours)
+        _, bw = cv2.threshold(img_np, 10, 255, cv2.THRESH_BINARY)
+
+        contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return []
+
         boxes = [cv2.boundingRect(c) for c in contours]
-        # Store as list of dicts to handle merging status
-        box_data = [{'box': b, 'merged': False} for b in boxes]
 
-        # Sort by X position
-        box_data.sort(key=lambda item: item['box'][0])
+        # 2) Remove tiny noise early
+        filtered = []
+        for (x, y, w, h) in boxes:
+            if w >= 4 and h >= 4 and (w * h) >= 25:
+                filtered.append((x, y, w, h))
+        boxes = filtered
+        if not boxes:
+            return []
 
-        final_boxes = []
-        
-        for i in range(len(box_data)):
-            if box_data[i]['merged']: continue
-            
-            x1, y1, w1, h1 = box_data[i]['box']
-            
-            # Check for a "dot" roughly above or below this box
-            # This is O(N^2) but N is small (< 20 letters usually)
-            merged_box = [x1, y1, w1, h1]
-            
-            for j in range(len(box_data)):
-                if i == j or box_data[j]['merged']: continue
-                
-                x2, y2, w2, h2 = box_data[j]['box']
-                
-                # Heuristic: If boxes are horizontally aligned (close in X)
-                # and one is vertically stacked
-                
-                # Centers
-                c1_x = x1 + w1/2
-                c2_x = x2 + w2/2
-                
-                if abs(c1_x - c2_x) < 20: # Horizontal overlap
-                    # It's a match! Merge them.
-                    box_data[j]['merged'] = True
-                    
-                    # Create new bounding box encasing both
-                    min_x = min(x1, x2)
-                    min_y = min(y1, y2)
-                    max_x = max(x1+w1, x2+w2)
-                    max_y = max(y1+h1, y2+h2)
-                    
-                    merged_box = [min_x, min_y, max_x - min_x, max_y - min_y]
-            
-            final_boxes.append(tuple(merged_box))
-            
-        # Re-sort final list left-to-right
-        final_boxes.sort(key=lambda b: b[0])
-        return final_boxes
+        # Sort left-to-right for consistency
+        boxes.sort(key=lambda b: b[0])
+
+        # 3) Estimate typical char height (median is robust)
+        hs = np.array([b[3] for b in boxes], dtype=np.float32)
+        median_h = float(np.median(hs)) if len(hs) else 0.0
+        if median_h <= 0:
+            return boxes
+
+        # Tunables (adjust if needed)
+        MARK_H_RATIO = 0.55          # below this height -> likely diacritic mark
+        X_OVERLAP_THRESH = 0.25      # overlap relative to smaller width
+        MAX_GAP_RATIO = 0.90         # max vertical gap relative to base height
+        CENTER_BAND_RATIO = 0.18     # if mark sits near base center, don't merge (prevents '-' merging)
+
+        mark_h_thresh = median_h * MARK_H_RATIO
+
+        merged = [list(b) for b in boxes]  # mutable copies
+        consumed_marks = set()
+
+        base_idxs = []
+        mark_idxs = []
+        for idx, (x, y, w, h) in enumerate(boxes):
+            if h < mark_h_thresh:
+                mark_idxs.append(idx)
+            else:
+                base_idxs.append(idx)
+
+        def x_overlap_ratio(a, b):
+            ax, ay, aw, ah = a
+            bx, by, bw_, bh_ = b
+            ax2, bx2 = ax + aw, bx + bw_
+            inter = max(0, min(ax2, bx2) - max(ax, bx))
+            denom = min(aw, bw_)
+            return (inter / denom) if denom > 0 else 0.0
+
+        # 4) Attach marks to bases
+        for mi in mark_idxs:
+            if mi in consumed_marks:
+                continue
+
+            mx, my, mw, mh = boxes[mi]
+            mark_cy = my + mh / 2.0
+
+            best_bi = None
+            best_ov = 0.0
+            best_gap = 1e9
+
+            for bi in base_idxs:
+                bx, by, bw_, bh_ = merged[bi]
+                base_cy = by + bh_ / 2.0
+
+                # Must overlap in X (ñ tilde overlaps the n in x-range)
+                ov = x_overlap_ratio((mx, my, mw, mh), (bx, by, bw_, bh_))
+                if ov < X_OVERLAP_THRESH:
+                    continue
+
+                # Mark must be clearly ABOVE or BELOW the base center
+                # (prevents '-' or middle strokes from being incorrectly merged)
+                if abs(mark_cy - base_cy) < (CENTER_BAND_RATIO * bh_):
+                    continue
+
+                # Compute vertical gap (0 if overlapping)
+                if my + mh <= by:
+                    gap = by - (my + mh)          # mark above base
+                elif by + bh_ <= my:
+                    gap = my - (by + bh_)         # mark below base (e.g., ç)
+                else:
+                    gap = 0
+
+                if gap > (MAX_GAP_RATIO * bh_):
+                    continue
+
+                # Score: prefer bigger overlap, then smaller gap
+                if (ov > best_ov) or (abs(ov - best_ov) < 1e-6 and gap < best_gap):
+                    best_bi = bi
+                    best_ov = ov
+                    best_gap = gap
+
+            if best_bi is not None:
+                bx, by, bw_, bh_ = merged[best_bi]
+                min_x = min(bx, mx)
+                min_y = min(by, my)
+                max_x = max(bx + bw_, mx + mw)
+                max_y = max(by + bh_, my + mh)
+                merged[best_bi] = [min_x, min_y, max_x - min_x, max_y - min_y]
+                consumed_marks.add(mi)
+
+        # 5) Return merged boxes excluding consumed marks
+        out = [tuple(merged[i]) for i in range(len(merged)) if i not in consumed_marks]
+        out.sort(key=lambda b: b[0])
+        return out
 
     def predict_drawing(self):
         img_np = np.array(self.image)
